@@ -37,6 +37,7 @@ edit_blink_interval = 0.6   # seconds
 edit_blink_visible = True
 
 is_playing = False
+is_playing_prerendered = False
 playback_start_time = 0.0
 playback_position = 0.0
 current_stream = None
@@ -543,70 +544,77 @@ def generate_note_for_chunk(frequency, t, full_duration, sample_rate=SAMPLE_RATE
     return wave
 
 def play_song(notes, tempo, tuning_a, tuningsystem, sample_rate=SAMPLE_RATE):
-    """Play all notes in the song"""
-    global is_playing
-    
-    if is_playing:
+    """Play all notes in the song from current scroll position"""
+    global is_playing_prerendered, playback_start_time, playback_position, scroll_x
+
+    if is_playing_prerendered:
+        # Stop if already playing
+        sd.stop()
+        is_playing_prerendered = False
         return
-    
+
     if not notes:
         print("No notes to play")
         return
-    
-    is_playing = True
-    
-    # Find the total length needed in twelfths
-    max_end = max(note.end_col() for note in notes)
-    
+
+    # Start from current scroll position
+    start_quarter = scroll_x // horizontal_zoom
+    start_position = start_quarter * 12  # in twelfths
+    playback_position = start_position
+
     # Convert tempo to seconds per twelfth
-    # tempo is in BPM (quarter notes per minute)
-    # 1 quarter note = 12 twelfths
     seconds_per_quarter = 60 / tempo
     seconds_per_twelfth = seconds_per_quarter / 12
-    
-    # Total duration in seconds
-    total_duration = max_end * seconds_per_twelfth
-    
+
+    # Filter notes that haven't ended yet
+    active_notes = [n for n in notes if n.end_col() > start_position]
+
+    if not active_notes:
+        print("No notes to play from this position")
+        return
+
+    # Find the total length needed
+    max_end = max(note.end_col() for note in active_notes)
+    total_duration = (max_end - start_position) * seconds_per_twelfth
+
     # Create empty audio buffer
-    padding_before = int(0.2 * sample_rate)  # 0.5 seconds before
-    padding_after = int(0.5 * sample_rate)   # 0.5 seconds after
+    padding_before = int(0.1 * sample_rate)
+    padding_after = int(0.5 * sample_rate)
     total_samples = int(total_duration * sample_rate) + padding_before + padding_after
     mix = np.zeros(total_samples)
-    
+
     # Add each note to the mix
-    for note in notes:
+    for note in active_notes:
         freq = note_to_frequency(note.pitch, tuning_a, tuningsystem)
         note_duration = note.duration * seconds_per_twelfth
-        note_start_time = note.start_col * seconds_per_twelfth
-        
+        # Adjust start time relative to playback start
+        note_start_time = (note.start_col - start_position) * seconds_per_twelfth
+
         # Generate the note
         wave = generate_note(freq, note_duration, sample_rate)
-        
-        # Add to mix at the correct position (offset by padding_before)
+
+        # Add to mix at the correct position
         start_sample = int(note_start_time * sample_rate) + padding_before
         end_sample = start_sample + len(wave)
-        
-        print(f"  -> samples: {start_sample} to {end_sample}")
-        
+
         if end_sample <= len(mix):
             mix[start_sample:end_sample] += wave
-            region_peak = np.max(np.abs(mix[start_sample:end_sample]))
         else:
-            # Clip if note extends beyond total duration
             mix[start_sample:] += wave[:len(mix) - start_sample]
-        
-    print(f"  -> mix length: {len(mix)}, end_sample: {end_sample}, fits: {end_sample <= len(mix)}")    
 
     peak = np.max(np.abs(mix))
-    if peak > 0:
-        mix = mix / peak * 0.8  # normalize to 80% volume
+    #if peak > 0:
+    #     mix = mix / peak * 0.8  # normalize to 80% volume
     # mix = np.tanh(mix) * 0.8
+    mix *= 0.08
 
-    # Play
+    is_playing_prerendered = True
+    playback_start_time = time.time()
+
+    # Play non-blocking
     sd.play(mix, samplerate=sample_rate)
-    sd.wait()
-    
-    is_playing = False  # Reset when done
+
+    print(f"Pre-rendered playback from position {start_position}")
 
 def generate_note_chunk(frequency, t, full_duration, sample_rate=96000):
     """Generate waveform for a chunk of time"""
@@ -638,7 +646,7 @@ def generate_note_chunk(frequency, t, full_duration, sample_rate=96000):
     
     square = np.zeros_like(t)
     for n in range(1, min(max_harmonic, 5), 2):
-        square += (1 / n) * np.sin(2 * np.pi * frequency * n * t + phase_offset)
+        square += (1 / n**0) * np.sin(2 * np.pi * frequency * n * t + phase_offset)
 
     wave = square
     wave *= envelope
@@ -838,8 +846,18 @@ def generate_note(frequency, duration, sample_rate=SAMPLE_RATE):
         sustain = np.ones(len(t) - len(fade_in) - len(fade_out))
         envelope = np.concatenate([fade_in, sustain, fade_out])
 
-    # Pure sine wave — single fundamental frequency, no harmonics
-    wave = np.sin(2 * np.pi * frequency * t)
+    # Additive synthesis — all harmonics, amplitude drops as 1/n
+    max_harmonic = int((sample_rate / 2) / frequency) - 1
+    num_harmonics = min(max_harmonic, 200)  # 16 harmonics is a good sweet spot
+
+    wave = np.zeros_like(t)
+    for n in range(1, num_harmonics + 1): # (1, num_harmonics, 2) for square, (1, num_harmonics + 1) for sine
+        wave += (1 / n) * np.sin(2 * np.pi * frequency * n * t)
+
+    # wave = np.zeros_like(t)
+    # for n in range(1, num_harmonics, 2):
+    #     harmonic_decay = np.exp(-0.1 * n**0.3 * t)  # higher harmonics fade faster
+    #     wave += (1 / n**1.1) * np.sin(2 * np.pi * frequency * n * t) * harmonic_decay
 
     wave = wave * envelope
     decay = np.exp(-0.2 * t)
@@ -1770,10 +1788,9 @@ def draw_grid():
                 (col + row) % 2 == 0
             ) else (159, 159, 159)
             pygame.draw.rect(grid_surface, color, rect)
-    
-    # First pass: draw notes from OTHER parts (gray)
-    for note in notes:
-        if note.part != SELECTED_PART and start_row <= note.pitch < end_row and (visible_start_col * 12) <= note.start_col <= (visible_end_col * 12):
+
+    for note in notes:          # First pass: draw notes from OTHER parts (gray)
+        if note.part != SELECTED_PART and start_row <= note.pitch < end_row and note.end_col() > (visible_start_col * 12) and note.start_col < (visible_end_col * 12):
             visible_col = note.start_col // 12
             sub_offset = (note.start_col % 12) * UI_SCALE
             x = int((visible_col * GRID_SIZE - (scroll_x / (horizontal_zoom / GRID_SIZE)) + sub_offset) * (horizontal_zoom / GRID_SIZE))
@@ -1784,9 +1801,8 @@ def draw_grid():
             color = (127, 127, 127)
             pygame.draw.rect(grid_surface, color, pygame.Rect(x, y, width, height))
 
-    # Second pass: draw notes from CURRENT part (black/white on top)
-    for note in notes:
-        if note.part == SELECTED_PART and start_row <= note.pitch < end_row and (visible_start_col * 12) <= note.start_col <= (visible_end_col * 12):
+    for note in notes:          # Second pass: draw notes from CURRENT part (black/white on top)
+        if note.part == SELECTED_PART and start_row <= note.pitch < end_row and note.end_col() > (visible_start_col * 12) and note.start_col < (visible_end_col * 12):
             visible_col = note.start_col // 12
             sub_offset = (note.start_col % 12) * UI_SCALE
             x = int((visible_col * GRID_SIZE - (scroll_x / (horizontal_zoom / GRID_SIZE)) + sub_offset) * (horizontal_zoom / GRID_SIZE))
@@ -1799,7 +1815,29 @@ def draw_grid():
 
     # scaled_width = int(GRID_WIDTH * (horizontal_zoom / GRID_SIZE))
     screen.blit(pygame.transform.scale(grid_surface, (GRID_WIDTH, GRID_HEIGHT)), (GRID_X, GRID_Y))
-    
+
+default_song = "demo4.song"
+if os.path.exists(default_song):
+    try:
+        with open(default_song, 'r') as f:
+            data = eval(f.read())
+        TEMPO = data.get('tempo', 72)
+        TUNING_A = data.get('tuning_a', 440)
+        TUNING_SYSTEM = data.get('tuning_system', 'equal temperament')
+        notes = []
+        for note_data in data.get('notes', []):
+            note = Note(
+                pitch=note_data['pitch'],
+                start_col=note_data['start_col'],
+                duration=note_data['duration'],
+                part=note_data['part']
+            )
+            notes.append(note)
+        current_file_path = default_song
+        print(f"Auto-loaded: {default_song}")
+    except Exception as e:
+        print(f"Error auto-loading {default_song}: {e}")
+
 # Main loop
 clock = pygame.time.Clock()
 running = True
@@ -1808,6 +1846,33 @@ while running:
     screen.fill((255, 255, 255))
     screen.blit(ui_image, (0, 0))  # Draw at top-left
     update_playback_scroll()
+
+    if is_playing_prerendered:
+        if not sd.get_stream().active:
+            # Playback finished
+            is_playing_prerendered = False
+        else:
+            # Update scroll (same logic as streaming)
+            if notes:
+                last_note_end = max(note.end_col() for note in notes)
+                last_note_end_rounded = math.ceil(last_note_end / 12) * 12
+                last_note_end_pixels = (last_note_end_rounded * horizontal_zoom) / 12
+                max_scroll_for_left_edge = last_note_end_pixels  + horizontal_zoom
+                absolute_max = get_max_scroll_x()
+                max_scroll = min(max_scroll_for_left_edge, absolute_max)
+            else:
+                max_scroll = get_max_scroll_x()
+
+            start_quarter = playback_position // 12
+            start_scroll = start_quarter * horizontal_zoom
+
+            elapsed = time.time() - playback_start_time
+            seconds_per_quarter = 60 / TEMPO
+            quarters_played = elapsed / seconds_per_quarter
+            current_quarter = start_quarter + quarters_played
+            target_scroll_x = int(current_quarter) * horizontal_zoom
+
+            scroll_x = max(start_scroll, min(target_scroll_x, max_scroll))
 
     if scroll_y % GRID_SIZE != 0:
         print(f"⚠️ Misaligned scroll_y: {scroll_y}")
@@ -1825,10 +1890,11 @@ while running:
             edit_blink_visible = not edit_blink_visible
     
     for event in pygame.event.get():
+
         if event.type == pygame.QUIT:
             running = False
         elif event.type == pygame.MOUSEBUTTONDOWN:
-            if editing_row is not None or is_playing:
+            if editing_row is not None or is_playing or is_playing_prerendered:
                 continue
             mouse_x, mouse_y = pygame.mouse.get_pos()
 
@@ -1975,6 +2041,9 @@ while running:
             # Space to play/stop (handle first, even during playback)
             if event.key == pygame.K_SPACE:
                 print(f"DEBUG: Space pressed, is_playing={is_playing}")
+                if is_playing_prerendered:
+                    print("Pre-rendered playback active - press P to stop")
+                    continue
                 if is_playing:
                     stop_playback()
                 else:
@@ -1982,7 +2051,7 @@ while running:
                     print(f"Playing song: Tempo={TEMPO}, A={TUNING_A}Hz, Tuning={TUNING_SYSTEM}")
 
             # Block all OTHER keys during playback
-            elif is_playing:
+            elif is_playing or is_playing_prerendered:
                 continue
 
             # File shortcuts (when not editing)
@@ -2263,7 +2332,10 @@ while running:
                         scroll_x = max(0, min(target_scroll, get_max_scroll_x()))
 
                 elif event.key == pygame.K_p:
-                    play_song(notes, TEMPO, TUNING_A, TUNING_SYSTEM)
+                    if is_playing:
+                        print("Streaming playback active - press Space to stop")
+                    else:
+                        play_song(notes, TEMPO, TUNING_A, TUNING_SYSTEM)
 
                 # Zoom
                 elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
